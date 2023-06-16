@@ -1,0 +1,20 @@
+[package]
+name = "e01"
+version = "0.1.0"
+authors = ["Aon"]
+edition = "2021"
+
+[lib]
+name = "e01"
+path = "src/lib.rs"
+
+[dependencies]
+kaitai = { git = "https://github.com/Agile86/kaitai_rust.git", branch = "rust_basic_support_v2" }
+simple-error = "*"
+libflate = "1.4.0"
+byteorder = "1.4.3"
+sha-1 = "0.10.1"
+sha2 = "0.9"
+glob = "0.3.1"
+
+ewf = { path = "C:/Projects/EWF" }
