@@ -175,17 +175,12 @@ pub struct Segment {
 
 #[derive(Debug)]
 struct Chunk {
-    chunk_number: usize,
     data_offset: u32,
     compressed: bool,
 }
 
 impl Segment {
-    fn read_table(
-        io: &BytesReader,
-        _size: u64,
-        mut chunk_count: usize,
-    ) -> Result<Vec<Chunk>, SimpleError> {
+    fn read_table(io: &BytesReader, _size: u64) -> Result<Vec<Chunk>, SimpleError> {
         let table_section = EwfTableHeader::read_into::<_, EwfTableHeader>(io, None, None)
             .map_err(|e| {
                 SimpleError::new(format!(
@@ -202,11 +197,9 @@ impl Segment {
             data_offset = entry & 0x7fffffff;
             data_offset += *table_section.table_base_offset() as u32;
             chunks.push(Chunk {
-                chunk_number: chunk_count,
                 data_offset,
                 compressed: (entry & 0x80000000) > 0,
             });
-            chunk_count += 1;
         }
         Ok(chunks)
     }
@@ -256,7 +249,7 @@ impl Segment {
             }
 
             if section_type == "table" {
-                chunks.extend(Segment::read_table(&io, section_size, chunks.len())?);
+                chunks.extend(Segment::read_table(&io, section_size)?);
             }
 
             if section_type == "sectors" {
@@ -280,8 +273,8 @@ impl Segment {
         Ok(segment)
     }
 
-    fn read_chunk(&self, chunk_number: usize) -> Result<Vec<u8>, SimpleError> {
-        let chunk_index = chunk_number - self.chunks.first().unwrap().chunk_number;
+    fn read_chunk(&self, chunk_index: usize) -> Result<Vec<u8>, SimpleError> {
+        debug_assert!(chunk_index < self.chunks.len());
         let chunk = &self.chunks[chunk_index];
         self.io
             .seek(chunk.data_offset as usize)
@@ -360,12 +353,21 @@ impl E01Reader {
         self.volume.max_offset()
     }
 
-    fn get_segment(&self, chunk_number: usize) -> Result<&Segment, SimpleError> {
+    fn get_segment(
+        &self,
+        chunk_number: usize,
+        chunk_index: &mut usize,
+    ) -> Result<&Segment, SimpleError> {
+        let mut chunks = 0;
         self.segments
             .iter()
             .find(|s| {
-                (s.chunks.first().unwrap().chunk_number..s.chunks.last().unwrap().chunk_number + 1)
-                    .contains(&chunk_number)
+                if chunk_number >= chunks && chunk_number < chunks + s.chunks.len() {
+                    *chunk_index = chunk_number - chunks;
+                    return true;
+                }
+                chunks += s.chunks.len();
+                false
             })
             .ok_or_else(|| {
                 SimpleError::new(format!("Requested chunk number {} is wrong", chunk_number))
@@ -385,7 +387,10 @@ impl E01Reader {
         while bytes_read < buf.len() && offset < total_size {
             let chunk_number = offset / self.chunk_size();
             debug_assert!(chunk_number < self.volume.chunk_count as usize);
-            let mut data = self.get_segment(chunk_number)?.read_chunk(chunk_number)?;
+            let mut chunk_index = 0;
+            let mut data = self
+                .get_segment(chunk_number, &mut chunk_index)?
+                .read_chunk(chunk_index)?;
 
             if chunk_number * self.chunk_size() + data.len() > total_size {
                 data = data[..total_size - chunk_number * self.chunk_size()].to_vec();

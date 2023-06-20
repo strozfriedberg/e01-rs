@@ -57,13 +57,18 @@ mod test {
     #[test]
     fn test_all_images() {
         assert_eq!(
-            do_hash("C:/temp/E01/image.E01"),
+            do_hash("data/image.E01"),
             "E5C6C296485B1146FEAD7AD552E1C3CCFC00BFAB"
         );
 
         assert_eq!(
-            do_hash("C:/temp/E01/test.E01"),
-            "3B4C136BA03700C6E970464FA68813017F6F9AF8"
+            do_hash("C:/temp/E01/mimage.E01"),
+            "F8677BD8A38A12476AE655A9F9F5336C287603F7"
+        );
+
+        assert_eq!(
+            do_hash("C:/temp/E01/multi.E01"),
+            "F8677BD8A38A12476AE655A9F9F5336C287603F7"
         );
     }
 
