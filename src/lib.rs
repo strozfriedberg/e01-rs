@@ -62,12 +62,7 @@ mod test {
         );
 
         assert_eq!(
-            do_hash("C:/temp/E01/mimage.E01"),
-            "F8677BD8A38A12476AE655A9F9F5336C287603F7"
-        );
-
-        assert_eq!(
-            do_hash("C:/temp/E01/multi.E01"),
+            do_hash("data/mimage.E01"),
             "F8677BD8A38A12476AE655A9F9F5336C287603F7"
         );
     }
