@@ -1,7 +1,8 @@
 use flate2::read::ZlibDecoder;
-use std::convert::TryFrom;
-use std::io::Read;
-use std::option::Option;
+use std::{
+    convert::TryFrom,
+    io::Read
+};
 use std::path::{Path, PathBuf};
 
 extern crate kaitai;
@@ -61,51 +62,97 @@ impl SegmentFileHeader {
 
         // read file header
 
-        if first_bytes == vec![0x45, 0x56, 0x46, 0x09, 0x0d, 0x0a, 0xff, 0x00] // EWF, EWF-E01, EWF-S01
-            || first_bytes == vec![0x4c, 0x56, 0x46, 0x09, 0x0d, 0x0a, 0xff, 0x00]
+        if first_bytes == [0x45, 0x56, 0x46, 0x09, 0x0d, 0x0a, 0xff, 0x00] // EWF, EWF-E01, EWF-S01
+            || first_bytes == [0x4c, 0x56, 0x46, 0x09, 0x0d, 0x0a, 0xff, 0x00]
         // EWF-L01
         // V1
         {
             match EwfFileHeaderV1::read_into::<_, EwfFileHeaderV1>(io, None, None) {
                 Ok(h) => {
-                    return Ok(SegmentFileHeader {
+                    Ok(SegmentFileHeader {
                         major_version: 1,
                         minor_version: 0,
                         compr_method: CompressionMethod::Deflate,
                         segment_number: *h.segment_number(),
-                    });
+                    })
                 }
                 Err(e) => {
-                    return Err(SimpleError::new(format!(
+                    Err(SimpleError::new(format!(
                         "Error while deserializing EwfFileHeaderV1 struct: {:?}",
                         e
-                    )));
+                    )))
                 }
             }
-        } else if first_bytes == vec![0x45, 0x56, 0x46, 0x32, 0x0d, 0x0a, 0x81, 0x00] // EVF2
-            || first_bytes == vec![0x4c, 0x45, 0x46, 0x32, 0x0d, 0x0a, 0x81, 0x00]
+        } else if first_bytes == [0x45, 0x56, 0x46, 0x32, 0x0d, 0x0a, 0x81, 0x00] // EVF2
+            || first_bytes == [0x4c, 0x45, 0x46, 0x32, 0x0d, 0x0a, 0x81, 0x00]
         // LEF2
         // V2
         {
             match EwfFileHeaderV2::read_into::<_, EwfFileHeaderV2>(io, None, None) {
                 Ok(h) => {
-                    return Ok(SegmentFileHeader {
+                    Ok(SegmentFileHeader {
                         major_version: *h.major_version(),
                         minor_version: *h.minor_version(),
                         compr_method: (*h.compression_method()).try_into()?,
                         segment_number: *h.segment_number(),
-                    });
+                    })
                 }
                 Err(e) => {
-                    return Err(SimpleError::new(format!(
+                    Err(SimpleError::new(format!(
                         "Error while deserializing EwfFileHeaderV2 struct: {:?}",
                         e
-                    )));
+                    )))
                 }
             }
         }
+        else {
+            Err(SimpleError::new("invalid segment file"))
+        }
+    }
+}
 
-        Err(SimpleError::new("invalid segment file"))
+fn checksum_err(
+    name: &str,
+    crc: u32,
+    crc_stored: u32
+) -> Result<(), SimpleError>
+{
+    Err(SimpleError::new(format!(
+        "{} checksum failed, calculated {}, expected {}",
+        name,
+        crc,
+        crc_stored
+    )))
+}
+
+fn checksum(bytes: &[u8]) -> Result<u32, SimpleError> {
+    adler32::adler32(std::io::Cursor::new(bytes))
+        .map_err(|e| SimpleError::new(format!("adler32 error: {:?}", e)))
+}
+
+fn checksum_reader(
+    reader: &BytesReader,
+    len: usize
+) -> Result<u32, SimpleError>
+{
+    checksum(
+        &reader
+            .read_bytes(len)
+            .map_err(|e| SimpleError::new(format!("read_bytes failed: {:?}", e)))?,
+    )
+}
+
+fn checksum_ok(
+    section_type: &str,
+    io: &BytesReader,
+    section_io: &BytesReader,
+    crc_stored: u32,
+) -> Result<(), SimpleError>
+{
+    let crc = checksum_reader(section_io, io.pos() - section_io.pos() - 4)?;
+    match crc == crc_stored {
+        true => Ok(()),
+        false => checksum_err(section_type, crc, crc_stored)
     }
 }
 
@@ -130,31 +177,23 @@ impl VolumeSection {
                 })?;
 
             if !ignore_checksums {
-                let crc_stored = *vol_section.checksum();
-
-                let crc = adler32::adler32(std::io::Cursor::new(
-                    vol_section
-                        ._io()
-                        .read_bytes(io.pos() - vol_section._io().pos() - 4)
-                        .map_err(|e| SimpleError::new(format!("read_bytes failed: {:?}", e)))?,
-                ))
-                .map_err(|e| SimpleError::new(format!("adler32 error: {:?}", e)))?;
-
-                if crc != crc_stored {
-                    return Err(SimpleError::new(format!(
-                        "Volume section checksum failed, calculated {}, expected {}",
-                        crc, crc_stored
-                    )));
-                }
+                checksum_ok(
+                    "Volume section",
+                    io,
+                    &vol_section._io(),
+                    *vol_section.checksum(),
+                )?;
             }
 
-            return Ok(VolumeSection {
+            let vs = VolumeSection {
                 chunk_count: *vol_section.number_of_chunks(),
                 sector_per_chunk: *vol_section.sector_per_chunk(),
                 bytes_per_sector: *vol_section.bytes_per_sector(),
                 total_sector_count: *vol_section.number_of_sectors(),
-            });
-        } else if size == 94 {
+            };
+            Ok(vs)
+        }
+        else if size == 94 {
             let vol_section = EwfVolumeSmart::read_into::<_, EwfVolumeSmart>(io, None, None)
                 .map_err(|e| {
                     SimpleError::new(format!(
@@ -164,32 +203,25 @@ impl VolumeSection {
                 })?;
 
             if !ignore_checksums {
-                let crc_stored = *vol_section.checksum();
-
-                let crc = adler32::adler32(std::io::Cursor::new(
-                    vol_section
-                        ._io()
-                        .read_bytes(io.pos() - vol_section._io().pos() - 4)
-                        .map_err(|e| SimpleError::new(format!("read_bytes failed: {:?}", e)))?,
-                ))
-                .map_err(|e| SimpleError::new(format!("adler32 error: {:?}", e)))?;
-
-                if crc != crc_stored {
-                    return Err(SimpleError::new(format!(
-                        "Volume section checksum failed, calculated {}, expected {}",
-                        crc, crc_stored
-                    )));
-                }
+                checksum_ok(
+                    "Volume section",
+                    io,
+                    &vol_section._io(),
+                    *vol_section.checksum(),
+                )?;
             }
 
-            return Ok(VolumeSection {
+            let vs = VolumeSection {
                 chunk_count: *vol_section.number_of_chunks(),
                 sector_per_chunk: *vol_section.sector_per_chunk(),
                 bytes_per_sector: *vol_section.bytes_per_sector(),
                 total_sector_count: *vol_section.number_of_sectors() as u64,
-            });
+            };
+            Ok(vs)
         }
-        Err(SimpleError::new(format!("Unknown volume size: {}", size)))
+        else {
+            Err(SimpleError::new(format!("Unknown volume size: {}", size)))
+        }
     }
 
     pub fn chunk_size(&self) -> usize {
@@ -220,8 +252,9 @@ pub struct Segment {
 
 #[derive(Debug)]
 struct Chunk {
-    data_offset: u32,
+    data_offset: u64,
     compressed: bool,
+    end_offset: Option<u64>,
 }
 
 impl Segment {
@@ -237,58 +270,48 @@ impl Segment {
                     e
                 ))
             })?;
+
         if !ignore_checksums {
-            let crc_stored = *table_section.checksum();
-
-            let crc = adler32::adler32(std::io::Cursor::new(
-                table_section
-                    ._io()
-                    .read_bytes(io.pos() - table_section._io().pos() - 4)
-                    .map_err(|e| SimpleError::new(format!("read_bytes failed: {:?}", e)))?,
-            ))
-            .map_err(|e| SimpleError::new(format!("adler32 error: {:?}", e)))?;
-
-            if crc != crc_stored {
-                return Err(SimpleError::new(format!(
-                    "Volume section checksum failed, calculated {}, expected {}",
-                    crc, crc_stored
-                )));
-            }
+            checksum_ok(
+                "Table section",
+                io,
+                &table_section._io(),
+                *table_section.checksum(),
+            )?;
         }
+
         let io_offsets = Clone::clone(io);
-        let mut data_offset: u32;
+        let mut data_offset: u64;
         let mut chunks: Vec<Chunk> = Vec::new();
         for _ in 0..*table_section.entry_count() {
             let entry = io.read_u4le().map_err(|e| {
                 SimpleError::new(format!("BytesReader::read_u4le() failed: {:?}", e))
             })?;
-            data_offset = entry & 0x7fffffff;
-            data_offset += *table_section.table_base_offset() as u32;
+            data_offset = (entry & 0x7fffffff) as u64;
+            data_offset += *table_section.table_base_offset();
             chunks.push(Chunk {
                 data_offset,
                 compressed: (entry & 0x80000000) > 0,
+                end_offset: None,
             });
         }
+
         if !ignore_checksums {
             // table footer
             let crc_stored = io.read_u4le().map_err(|e| {
                 SimpleError::new(format!("BytesReader::read_u4le() failed: {:?}", e))
             })?;
 
-            let crc = adler32::adler32(std::io::Cursor::new(
-                io_offsets
-                    .read_bytes(*table_section.entry_count() as usize * 4)
-                    .map_err(|e| SimpleError::new(format!("read_bytes failed: {:?}", e)))?,
-            ))
-            .map_err(|e| SimpleError::new(format!("adler32 error: {:?}", e)))?;
+            let crc = checksum_reader(
+                &io_offsets,
+                *table_section.entry_count() as usize * 4
+            )?;
 
             if crc != crc_stored {
-                return Err(SimpleError::new(format!(
-                    "Table offset array is broken, checksum calculated {}, expected {}",
-                    crc, crc_stored
-                )));
+                checksum_err("Table offset array", crc, crc_stored)?;
             }
         }
+
         Ok(chunks)
     }
 
@@ -305,23 +328,14 @@ impl Segment {
             })?;
 
         if !ignore_checksums {
-            let crc_stored = *hash_section.checksum();
-
-            let crc = adler32::adler32(std::io::Cursor::new(
-                hash_section
-                    ._io()
-                    .read_bytes(io.pos() - hash_section._io().pos() - 4)
-                    .map_err(|e| SimpleError::new(format!("read_bytes failed: {:?}", e)))?,
-            ))
-            .map_err(|e| SimpleError::new(format!("adler32 error: {:?}", e)))?;
-
-            if crc != crc_stored {
-                return Err(SimpleError::new(format!(
-                    "Hash section checksum failed, calculated {}, expected {}",
-                    crc, crc_stored
-                )));
-            }
+            checksum_ok(
+                "Hash section",
+                io,
+                &hash_section._io(),
+                *hash_section.checksum(),
+            )?;
         }
+
         Ok(hash_section.clone())
     }
 
@@ -338,23 +352,14 @@ impl Segment {
             })?;
 
         if !ignore_checksums {
-            let crc_stored = *digest_section.checksum();
-
-            let crc = adler32::adler32(std::io::Cursor::new(
-                digest_section
-                    ._io()
-                    .read_bytes(io.pos() - digest_section._io().pos() - 4)
-                    .map_err(|e| SimpleError::new(format!("read_bytes failed: {:?}", e)))?,
-            ))
-            .map_err(|e| SimpleError::new(format!("adler32 error: {:?}", e)))?;
-
-            if crc != crc_stored {
-                return Err(SimpleError::new(format!(
-                    "Hash section checksum failed, calculated {}, expected {}",
-                    crc, crc_stored
-                )));
-            }
+            checksum_ok(
+                "Digest section",
+                io,
+                &digest_section._io(),
+                *digest_section.checksum(),
+            )?;
         }
+
         Ok(digest_section.clone())
     }
 
@@ -385,10 +390,10 @@ impl Segment {
                 EwfSectionDescriptorV1::read_into::<_, EwfSectionDescriptorV1>(&io, None, None)
                     .map_err(|e| {
                         SimpleError::new(format!(
-                    "Segment file: {}, error while deserializing EwfFileHeaderV1 struct: {:?}",
-                    f.as_ref().to_string_lossy(),
-                    e
-                ))
+                            "Segment file: {}, error while deserializing EwfFileHeaderV1 struct: {:?}",
+                            f.as_ref().to_string_lossy(),
+                            e
+                        ))
                     })?;
 
             let section_offset = *section.next_offset() as usize;
@@ -408,6 +413,8 @@ impl Segment {
 
             if section_type == "table" {
                 chunks.extend(Segment::read_table(&io, section_size, ignore_checksums)?);
+                let chunks_len = chunks.len();
+                chunks[chunks_len - 1].end_offset = Some(end_of_sectors);
             }
 
             if section_type == "sectors" {
@@ -456,43 +463,53 @@ impl Segment {
 
         let end_offset = if chunk_index == self.chunks.len() - 1 {
             self.end_of_sectors
-        } else {
-            self.chunks[chunk_index + 1].data_offset as u64
+        }
+        else if let Some(end_of_section) = chunk.end_offset {
+            end_of_section
+        }
+        else {
+            self.chunks[chunk_index + 1].data_offset
         };
 
-        let raw_data = self
+        let mut raw_data = self
             .io
             .read_bytes(end_offset as usize - chunk.data_offset as usize)
             .map_err(|e| SimpleError::new(format!("Read error: {:?}", e)))?;
 
         if !chunk.compressed {
             if !ignore_checksums {
-                let crc = adler32::adler32(std::io::Cursor::new(
-                    raw_data[..raw_data.len() - 4].to_vec(),
-                ))
-                .map_err(|e| SimpleError::new(format!("adler32 error: {:?}", e)))?;
-
+                // read stored checksum
                 let crc_stored = u32::from_le_bytes(
                     raw_data[raw_data.len() - 4..]
                         .try_into()
                         .map_err(|e| SimpleError::new(format!("Convert error: {:?}", e)))?,
                 );
+
+                // remove stored checksum from data
+                raw_data.truncate(raw_data.len() - 4);
+
+                // checksum the data
+                let crc = checksum(&raw_data)?;
+
                 if crc != crc_stored {
-                    return Err(SimpleError::new(format!(
-                        "Chunk #{} checksum failed, calculated {}, expected {}",
-                        chunk_number, crc, crc_stored
-                    )));
+                    checksum_err(
+                        &format!("Chunk {}", chunk_number),
+                        crc,
+                        crc_stored
+                    )?;
                 }
             }
-            return Ok(raw_data[..raw_data.len() - 4].to_vec());
-        }
 
-        let mut decoder = ZlibDecoder::new(&raw_data[..]);
-        let mut data = Vec::new();
-        decoder
-            .read_to_end(&mut data)
-            .map_err(|e| SimpleError::new(format!("Decompression failed: {}", e)))?;
-        Ok(data)
+            Ok(raw_data)
+        }
+        else {
+            let mut decoder = ZlibDecoder::new(&raw_data[..]);
+            let mut data = Vec::new();
+            decoder
+                .read_to_end(&mut data)
+                .map_err(|e| SimpleError::new(format!("Decompression failed: {}", e)))?;
+            Ok(data)
+        }
     }
 }
 
@@ -546,16 +563,19 @@ impl E01Reader {
         }
         let volume = volume_opt.ok_or(SimpleError::new("Missing volume section"))?;
         let chunks = segments.iter().fold(0, |acc, i| acc + i.chunks.len());
+
         if chunks != volume.chunk_count as usize {
-            return Err(SimpleError::new("Missing some segment file."));
+            Err(SimpleError::new("Missing some segment file."))
         }
-        Ok(E01Reader {
-            volume,
-            segments,
-            ignore_checksums,
-            stored_md5,
-            stored_sha1,
-        })
+        else {
+            Ok(E01Reader {
+                volume,
+                segments,
+                ignore_checksums,
+                stored_md5,
+                stored_sha1,
+            })
+        }
     }
 
     pub fn total_size(&self) -> usize {
@@ -583,7 +603,12 @@ impl E01Reader {
             })
     }
 
-    pub fn read_at_offset(&self, mut offset: usize, buf: &mut [u8]) -> Result<usize, SimpleError> {
+    pub fn read_at_offset(
+        &self,
+        mut offset: usize,
+        buf: &mut [u8]
+    ) -> Result<usize, SimpleError>
+    {
         let total_size = self.total_size();
         if offset > total_size {
             return Err(SimpleError::new(format!(
@@ -597,13 +622,15 @@ impl E01Reader {
             let chunk_number = offset / self.chunk_size();
             debug_assert!(chunk_number < self.volume.chunk_count as usize);
             let mut chunk_index = 0;
+
             let mut data = self
                 .get_segment(chunk_number, &mut chunk_index)?
                 .read_chunk(chunk_number, chunk_index, self.ignore_checksums)?;
 
             if chunk_number * self.chunk_size() + data.len() > total_size {
-                data = data[..total_size - chunk_number * self.chunk_size()].to_vec();
+                data.truncate(total_size - chunk_number * self.chunk_size());
             }
+
             let data_offset = offset % self.chunk_size();
 
             if buf.len() < bytes_read || data.len() < data_offset {
