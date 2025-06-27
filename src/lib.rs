@@ -1,13 +1,19 @@
 pub mod e01_reader;
+mod error;
 mod generated;
+mod sec_read;
+mod seg_path;
+mod segment;
 
 #[cfg(test)]
 mod test {
     use crate::e01_reader::E01Reader;
 
     use hex;
-    use md5::digest::DynDigest;
-    use md5::Md5;
+    use md5::{
+        Md5,
+        digest::DynDigest
+    };
     use rand::Rng;
     use sha1::Sha1;
     use sha2::{Digest, Sha256};
@@ -67,7 +73,7 @@ mod test {
         expected_sha1: &str,
         expected_sha256: &str
     ) {
-        let reader = E01Reader::open(image_path, false).unwrap();
+        let reader = E01Reader::open_glob(image_path, false).unwrap();
 
         let stored_md5 = reader.get_stored_md5().map(hex::encode);
         let stored_sha1 = reader.get_stored_sha1().map(hex::encode);

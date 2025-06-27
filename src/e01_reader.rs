@@ -1,631 +1,367 @@
-use flate2::read::ZlibDecoder;
-use std::{
-    convert::TryFrom,
-    io::Read
-};
 use std::path::{Path, PathBuf};
+use tracing::{debug, debug_span, warn};
 
 extern crate kaitai;
-use self::kaitai::*;
 
-use crate::generated::ewf_file_header_v1::*;
-use crate::generated::ewf_file_header_v2::*;
-use crate::generated::ewf_section_descriptor_v1::*;
-//use crate::generated::ewf_section_descriptor_v2::*;
-use crate::generated::ewf_digest_section::*;
-use crate::generated::ewf_hash_section::*;
-use crate::generated::ewf_table_header::*;
-use crate::generated::ewf_volume::*;
-use crate::generated::ewf_volume_smart::*;
+use kaitai::{BytesReader, KError};
 
-use simple_error::SimpleError;
+use crate::error::{IoError, LibError};
+use crate::sec_read::{VolumeSection, Section, SectionIterator};
+use crate::seg_path::{find_segment_paths, UnrecognizedExtension};
+use crate::segment::{Segment, SegmentFileHeader};
 
-#[derive(Debug)]
-pub enum CompressionMethod {
-    None = 0,
-    Deflate = 1,
-    Bzip = 2,
-}
-
-impl TryFrom<u16> for CompressionMethod {
-    type Error = SimpleError;
-
-    fn try_from(v: u16) -> Result<Self, Self::Error> {
-        match v {
-            x if x == Self::None as u16 => Ok(Self::None),
-            x if x == Self::Deflate as u16 => Ok(Self::Deflate),
-            x if x == Self::Bzip as u16 => Ok(Self::Bzip),
-            _ => Err(SimpleError::new(format!(
-                "Unknown compression method value: {}",
-                v
-            ))),
-        }
+#[derive(Debug, thiserror::Error)]
+pub enum OpenError {
+    #[error("{0}")]
+    PathGlobError(#[from] UnrecognizedExtension),
+    #[error("No segment files given")]
+    NoSegmentFiles,
+    #[error("Missing volume section in {0}")]
+    MissingVolumeSection(PathBuf),
+    #[error("Too many chunks found: actual {0}, expected {1}")]
+    TooManyChunks(usize, usize),
+    #[error("Too few chunks found: actual {0}, expected {1}")]
+    TooFewChunks(usize, usize),
+    #[error("Error reading {path}: {source}")]
+    IoError {
+        path: PathBuf,
+        #[source]
+        source: LibError
+    },
+    #[error("Bad data in {path}: {source}")]
+    BadData {
+        path: PathBuf,
+        #[source]
+        source: LibError
     }
 }
 
-#[derive(Debug)]
-pub struct SegmentFileHeader {
-    pub major_version: u8,
-    pub minor_version: u8,
-    pub compr_method: CompressionMethod,
-    pub segment_number: u16,
-}
-
-impl SegmentFileHeader {
-    pub fn new(io: &BytesReader) -> Result<Self, SimpleError> {
-        let first_bytes = io
-            .read_bytes(8)
-            .map_err(|e| SimpleError::new(format!("read_bytes error: {:?}", e)))?;
-
-        io.seek(0)
-            .map_err(|e| SimpleError::new(format!("seek error: {:?}", e)))?;
-
-        // read file header
-
-        if first_bytes == [0x45, 0x56, 0x46, 0x09, 0x0d, 0x0a, 0xff, 0x00] // EWF, EWF-E01, EWF-S01
-            || first_bytes == [0x4c, 0x56, 0x46, 0x09, 0x0d, 0x0a, 0xff, 0x00]
-        // EWF-L01
-        // V1
-        {
-            match EwfFileHeaderV1::read_into::<_, EwfFileHeaderV1>(io, None, None) {
-                Ok(h) => {
-                    Ok(SegmentFileHeader {
-                        major_version: 1,
-                        minor_version: 0,
-                        compr_method: CompressionMethod::Deflate,
-                        segment_number: *h.segment_number(),
-                    })
-                }
-                Err(e) => {
-                    Err(SimpleError::new(format!(
-                        "Error while deserializing EwfFileHeaderV1 struct: {:?}",
-                        e
-                    )))
-                }
-            }
-        } else if first_bytes == [0x45, 0x56, 0x46, 0x32, 0x0d, 0x0a, 0x81, 0x00] // EVF2
-            || first_bytes == [0x4c, 0x45, 0x46, 0x32, 0x0d, 0x0a, 0x81, 0x00]
-        // LEF2
-        // V2
-        {
-            match EwfFileHeaderV2::read_into::<_, EwfFileHeaderV2>(io, None, None) {
-                Ok(h) => {
-                    Ok(SegmentFileHeader {
-                        major_version: *h.major_version(),
-                        minor_version: *h.minor_version(),
-                        compr_method: (*h.compression_method()).try_into()?,
-                        segment_number: *h.segment_number(),
-                    })
-                }
-                Err(e) => {
-                    Err(SimpleError::new(format!(
-                        "Error while deserializing EwfFileHeaderV2 struct: {:?}",
-                        e
-                    )))
-                }
+impl From<LibError> for OpenError {
+    fn from(e: LibError) -> Self {
+        match e {
+            LibError::IoError(_) => Self::IoError {
+                path: "".into(), // set using with_path()
+                source: e
+            },
+            _ => Self::BadData {
+                path: "".into(), // set using with_path()
+                source: e
             }
         }
-        else {
-            Err(SimpleError::new("invalid segment file"))
+    }
+}
+
+impl From<KError> for OpenError {
+    fn from(e: KError) -> Self {
+        Self::IoError {
+            path: "".into(), // set using with_path()
+            source: LibError::IoError(IoError::ReadError(e))
         }
     }
 }
 
-fn checksum_err(
-    name: &str,
-    crc: u32,
-    crc_stored: u32
-) -> Result<(), SimpleError>
-{
-    Err(SimpleError::new(format!(
-        "{} checksum failed, calculated {}, expected {}",
-        name,
-        crc,
-        crc_stored
-    )))
-}
-
-fn checksum(bytes: &[u8]) -> Result<u32, SimpleError> {
-    adler32::adler32(std::io::Cursor::new(bytes))
-        .map_err(|e| SimpleError::new(format!("adler32 error: {:?}", e)))
-}
-
-fn checksum_reader(
-    reader: &BytesReader,
-    len: usize
-) -> Result<u32, SimpleError>
-{
-    checksum(
-        &reader
-            .read_bytes(len)
-            .map_err(|e| SimpleError::new(format!("read_bytes failed: {:?}", e)))?,
-    )
-}
-
-fn checksum_ok(
-    section_type: &str,
-    io: &BytesReader,
-    section_io: &BytesReader,
-    crc_stored: u32,
-) -> Result<(), SimpleError>
-{
-    let crc = checksum_reader(section_io, io.pos() - section_io.pos() - 4)?;
-    match crc == crc_stored {
-        true => Ok(()),
-        false => checksum_err(section_type, crc, crc_stored)
+impl OpenError {
+    fn with_path<T: AsRef<Path>>(self, path: T) -> Self {
+        match self {
+            Self::IoError { source, .. } => Self::IoError {
+                path: path.as_ref().into(),
+                source
+            },
+            Self::BadData { source, .. } => Self::BadData {
+                path: path.as_ref().into(),
+                source
+            },
+            _ => self
+        }
     }
 }
 
-#[derive(Debug, Default)]
-pub struct VolumeSection {
-    pub chunk_count: u32,
-    pub sector_per_chunk: u32,
-    pub bytes_per_sector: u32,
-    pub total_sector_count: u64,
+#[derive(Debug, thiserror::Error)]
+pub enum ReadError {
+    #[error("Requested chunk number {0} does not exist")]
+    BadChunkNumber(usize),
+    #[error("Requested offset {0} is beyond end of image {1}")]
+    OffsetBeyondEnd(usize, usize),
+    #[error("Error reading {path}: {source}")]
+    IoError {
+        path: PathBuf,
+        #[source]
+        source: LibError
+    },
+    #[error("Bad data in {path}: {source}")]
+    BadData {
+        path: PathBuf,
+        #[source]
+        source: LibError
+    }
 }
 
-impl VolumeSection {
-    pub fn new(io: &BytesReader, size: u64, ignore_checksums: bool) -> Result<Self, SimpleError> {
-        // read volume section
-        if size == 1052 {
-            let vol_section =
-                EwfVolume::read_into::<_, EwfVolume>(io, None, None).map_err(|e| {
-                    SimpleError::new(format!(
-                        "Error while deserializing EwfVolume struct: {:?}",
-                        e
-                    ))
-                })?;
-
-            if !ignore_checksums {
-                checksum_ok(
-                    "Volume section",
-                    io,
-                    &vol_section._io(),
-                    *vol_section.checksum(),
-                )?;
+impl From<LibError> for ReadError {
+    fn from(e: LibError) -> Self {
+        match e {
+            LibError::IoError(_) => Self::IoError {
+                path: "".into(), // set using with_path()
+                source: e
+            },
+            _ => Self::BadData {
+                path: "".into(), // set using with_path()
+                source: e
             }
-
-            let vs = VolumeSection {
-                chunk_count: *vol_section.number_of_chunks(),
-                sector_per_chunk: *vol_section.sector_per_chunk(),
-                bytes_per_sector: *vol_section.bytes_per_sector(),
-                total_sector_count: *vol_section.number_of_sectors(),
-            };
-            Ok(vs)
-        }
-        else if size == 94 {
-            let vol_section = EwfVolumeSmart::read_into::<_, EwfVolumeSmart>(io, None, None)
-                .map_err(|e| {
-                    SimpleError::new(format!(
-                        "Error while deserializing EwfVolumeSmart struct: {:?}",
-                        e
-                    ))
-                })?;
-
-            if !ignore_checksums {
-                checksum_ok(
-                    "Volume section",
-                    io,
-                    &vol_section._io(),
-                    *vol_section.checksum(),
-                )?;
-            }
-
-            let vs = VolumeSection {
-                chunk_count: *vol_section.number_of_chunks(),
-                sector_per_chunk: *vol_section.sector_per_chunk(),
-                bytes_per_sector: *vol_section.bytes_per_sector(),
-                total_sector_count: *vol_section.number_of_sectors() as u64,
-            };
-            Ok(vs)
-        }
-        else {
-            Err(SimpleError::new(format!("Unknown volume size: {}", size)))
         }
     }
+}
 
-    pub fn chunk_size(&self) -> usize {
-        self.sector_per_chunk as usize * self.bytes_per_sector as usize
+impl ReadError {
+    fn with_path<T: AsRef<Path>>(self, path: T) -> Self {
+        match self {
+            Self::IoError { source, .. } => Self::IoError {
+                path: path.as_ref().into(),
+                source
+            },
+            Self::BadData { source, .. } => Self::BadData {
+                path: path.as_ref().into(),
+                source
+            },
+            _ => self
+        }
     }
+}
 
-    pub fn max_offset(&self) -> usize {
-        self.total_sector_count as usize * self.bytes_per_sector as usize
-    }
+#[derive(Debug, thiserror::Error)]
+pub enum E01Error {
+    #[error("{0}")]
+    OpenError(#[from] OpenError),
+    #[error("{0}")]
+    ReadError(#[from] ReadError)
 }
 
 #[derive(Debug)]
 pub struct E01Reader {
     volume: VolumeSection,
-    segments: Vec<Segment>,
-    ignore_checksums: bool,
+    segments: Vec<(PathBuf, Segment)>,
     stored_md5: Option<Vec<u8>>,
     stored_sha1: Option<Vec<u8>>,
-}
-
-#[derive(Debug)]
-pub struct Segment {
-    io: BytesReader,
-    _header: SegmentFileHeader,
-    chunks: Vec<Chunk>,
-    end_of_sectors: u64,
-}
-
-#[derive(Debug)]
-struct Chunk {
-    data_offset: u64,
-    compressed: bool,
-    end_offset: Option<u64>,
-}
-
-impl Segment {
-    fn read_table(
-        io: &BytesReader,
-        _size: u64,
-        ignore_checksums: bool,
-    ) -> Result<Vec<Chunk>, SimpleError> {
-        let table_section = EwfTableHeader::read_into::<_, EwfTableHeader>(io, None, None)
-            .map_err(|e| {
-                SimpleError::new(format!(
-                    "Error while deserializing EwfTableHeader struct: {:?}",
-                    e
-                ))
-            })?;
-
-        if !ignore_checksums {
-            checksum_ok(
-                "Table section",
-                io,
-                &table_section._io(),
-                *table_section.checksum(),
-            )?;
-        }
-
-        let io_offsets = Clone::clone(io);
-        let mut data_offset: u64;
-        let mut chunks: Vec<Chunk> = Vec::new();
-        for _ in 0..*table_section.entry_count() {
-            let entry = io.read_u4le().map_err(|e| {
-                SimpleError::new(format!("BytesReader::read_u4le() failed: {:?}", e))
-            })?;
-            data_offset = (entry & 0x7fffffff) as u64;
-            data_offset += *table_section.table_base_offset();
-            chunks.push(Chunk {
-                data_offset,
-                compressed: (entry & 0x80000000) > 0,
-                end_offset: None,
-            });
-        }
-
-        if !ignore_checksums {
-            // table footer
-            let crc_stored = io.read_u4le().map_err(|e| {
-                SimpleError::new(format!("BytesReader::read_u4le() failed: {:?}", e))
-            })?;
-
-            let crc = checksum_reader(
-                &io_offsets,
-                *table_section.entry_count() as usize * 4
-            )?;
-
-            if crc != crc_stored {
-                checksum_err("Table offset array", crc, crc_stored)?;
-            }
-        }
-
-        Ok(chunks)
-    }
-
-    fn get_hash_section(
-        io: &BytesReader,
-        ignore_checksums: bool,
-    ) -> Result<OptRc<EwfHashSection>, SimpleError> {
-        let hash_section =
-            EwfHashSection::read_into::<_, EwfHashSection>(io, None, None).map_err(|e| {
-                SimpleError::new(format!(
-                    "Error while deserializing EwfHashSection struct: {:?}",
-                    e
-                ))
-            })?;
-
-        if !ignore_checksums {
-            checksum_ok(
-                "Hash section",
-                io,
-                &hash_section._io(),
-                *hash_section.checksum(),
-            )?;
-        }
-
-        Ok(hash_section.clone())
-    }
-
-    fn get_digest_section(
-        io: &BytesReader,
-        ignore_checksums: bool,
-    ) -> Result<OptRc<EwfDigestSection>, SimpleError> {
-        let digest_section = EwfHashSection::read_into::<_, EwfDigestSection>(io, None, None)
-            .map_err(|e| {
-                SimpleError::new(format!(
-                    "Error while deserializing EwfDigestSection struct: {:?}",
-                    e
-                ))
-            })?;
-
-        if !ignore_checksums {
-            checksum_ok(
-                "Digest section",
-                io,
-                &digest_section._io(),
-                *digest_section.checksum(),
-            )?;
-        }
-
-        Ok(digest_section.clone())
-    }
-
-    pub fn read<T: AsRef<Path>>(
-        f: T,
-        volume: &mut Option<VolumeSection>,
-        stored_md5: &mut Option<Vec<u8>>,
-        stored_sha1: &mut Option<Vec<u8>>,
-        ignore_checksums: bool,
-    ) -> Result<Self, SimpleError> {
-        let io = BytesReader::open(f.as_ref())
-            .map_err(|e| SimpleError::new(format!("BytesReader::open failed: {:?}", e)))?;
-        let header = SegmentFileHeader::new(&io)?;
-        let mut chunks: Vec<Chunk> = Vec::new();
-        let mut end_of_sectors = 0;
-        let mut current_offset = io.pos();
-        while current_offset < io.size() {
-            io.seek(current_offset).map_err(|e| {
-                SimpleError::new(format!(
-                    "Segment file {}, seek to {} failed: {:?}",
-                    f.as_ref().to_string_lossy(),
-                    current_offset,
-                    e
-                ))
-            })?;
-
-            let section =
-                EwfSectionDescriptorV1::read_into::<_, EwfSectionDescriptorV1>(&io, None, None)
-                    .map_err(|e| {
-                        SimpleError::new(format!(
-                            "Segment file: {}, error while deserializing EwfFileHeaderV1 struct: {:?}",
-                            f.as_ref().to_string_lossy(),
-                            e
-                        ))
-                    })?;
-
-            let section_offset = *section.next_offset() as usize;
-            let section_size = if *section.size() > 0x4c
-            /* header size */
-            {
-                *section.size() - 0x4c
-            } else {
-                0
-            };
-            let section_type_full = section.type_string();
-            let section_type = section_type_full.trim_matches(char::from(0));
-
-            if section_type == "disk" || section_type == "volume" {
-                *volume = Some(VolumeSection::new(&io, section_size, ignore_checksums)?);
-            }
-
-            if section_type == "table" {
-                chunks.extend(Segment::read_table(&io, section_size, ignore_checksums)?);
-                let chunks_len = chunks.len();
-                chunks[chunks_len - 1].end_offset = Some(end_of_sectors);
-            }
-
-            if section_type == "sectors" {
-                end_of_sectors = io.pos() as u64 + section_size;
-            }
-
-            if section_type == "hash" {
-                let hash_section = Self::get_hash_section(&io, ignore_checksums)?;
-                *stored_md5 = Some(hash_section.md5().clone());
-            }
-
-            if section_type == "digest" {
-                let digest_section = Self::get_digest_section(&io, ignore_checksums)?;
-                *stored_md5 = Some(digest_section.md5().clone());
-                *stored_sha1 = Some(digest_section.sha1().clone());
-            }
-
-            if current_offset == section_offset || section_type == "done" {
-                break;
-            }
-
-            current_offset = section_offset;
-        }
-
-        let segment = Segment {
-            io,
-            _header: header,
-            chunks,
-            end_of_sectors,
-        };
-
-        Ok(segment)
-    }
-
-    fn read_chunk(
-        &self,
-        chunk_number: usize,
-        chunk_index: usize,
-        ignore_checksums: bool,
-    ) -> Result<Vec<u8>, SimpleError> {
-        debug_assert!(chunk_index < self.chunks.len());
-        let chunk = &self.chunks[chunk_index];
-        self.io
-            .seek(chunk.data_offset as usize)
-            .map_err(|e| SimpleError::new(format!("Seek error: {:?}", e)))?;
-
-        let end_offset = if chunk_index == self.chunks.len() - 1 {
-            self.end_of_sectors
-        }
-        else if let Some(end_of_section) = chunk.end_offset {
-            end_of_section
-        }
-        else {
-            self.chunks[chunk_index + 1].data_offset
-        };
-
-        let mut raw_data = self
-            .io
-            .read_bytes(end_offset as usize - chunk.data_offset as usize)
-            .map_err(|e| SimpleError::new(format!("Read error: {:?}", e)))?;
-
-        if !chunk.compressed {
-            if !ignore_checksums {
-                // read stored checksum
-                let crc_stored = u32::from_le_bytes(
-                    raw_data[raw_data.len() - 4..]
-                        .try_into()
-                        .map_err(|e| SimpleError::new(format!("Convert error: {:?}", e)))?,
-                );
-
-                // remove stored checksum from data
-                raw_data.truncate(raw_data.len() - 4);
-
-                // checksum the data
-                let crc = checksum(&raw_data)?;
-
-                if crc != crc_stored {
-                    checksum_err(
-                        &format!("Chunk {}", chunk_number),
-                        crc,
-                        crc_stored
-                    )?;
-                }
-            }
-
-            Ok(raw_data)
-        }
-        else {
-            let mut decoder = ZlibDecoder::new(&raw_data[..]);
-            let mut data = Vec::new();
-            decoder
-                .read_to_end(&mut data)
-                .map_err(|e| SimpleError::new(format!("Decompression failed: {}", e)))?;
-            Ok(data)
-        }
-    }
+    ignore_checksums: bool
 }
 
 impl E01Reader {
-    fn find_all_segments(path: &Path) -> Result<Vec<PathBuf>, SimpleError> {
-        let filestem = path
-            .file_stem()
-            .ok_or_else(|| SimpleError::new("Invalid file name"))?
-            .to_str()
-            .ok_or_else(|| SimpleError::new("Invalid file name"))?;
-        let ext_str = path
-            .extension()
-            .ok_or_else(|| SimpleError::new("Invalid extension"))?
-            .to_str()
-            .ok_or_else(|| SimpleError::new("Invalid extension"))?;
-
-        if !['E', 'L', 'S'].contains(&ext_str.chars().next().unwrap().to_ascii_uppercase()) {
-            return Err(SimpleError::new(format!(
-                "Invalid EWF file: {}",
-                path.display()
-            )));
-        }
-
-        let pattern = format!("{}/{}.[ELS]??", path.parent().unwrap().display(), filestem);
-        let files = glob::glob(&pattern).map_err(|_| SimpleError::new("Glob error"))?;
-        let mut paths: Vec<PathBuf> = files.filter_map(|f| f.ok()).collect();
-        paths.sort();
-        Ok(paths)
-    }
-
-    pub fn open<T: AsRef<Path>>(f: T, ignore_checksums: bool) -> Result<Self, SimpleError> {
-        let mut segments: Vec<Segment> = Vec::new();
-        let mut volume_opt: Option<VolumeSection> = None;
-        let mut stored_md5: Option<_> = None;
-        let mut stored_sha1: Option<_> = None;
-        let segments_path = E01Reader::find_all_segments(f.as_ref())?;
-        if segments_path.is_empty() {
-            return Err(SimpleError::new(format!(
-                "Can't find file(s): {}",
-                f.as_ref().to_string_lossy()
-            )));
-        }
-        for s in segments_path {
-            segments.push(Segment::read(
-                s,
-                &mut volume_opt,
-                &mut stored_md5,
-                &mut stored_sha1,
-                ignore_checksums,
-            )?);
-        }
-        let volume = volume_opt.ok_or(SimpleError::new("Missing volume section"))?;
-        let chunks = segments.iter().fold(0, |acc, i| acc + i.chunks.len());
-
-        if chunks != volume.chunk_count as usize {
-            Err(SimpleError::new("Missing some segment file."))
+    pub fn open_glob<T: AsRef<Path>>(
+        example_segment_path: T,
+        ignore_checksums: bool
+    ) -> Result<Self, OpenError>
+    {
+        if example_segment_path.as_ref().exists() {
+            Self::open(
+                find_segment_paths(&example_segment_path)?,
+                ignore_checksums
+            )
         }
         else {
-            Ok(E01Reader {
-                volume,
-                segments,
-                ignore_checksums,
-                stored_md5,
-                stored_sha1,
-            })
+            Err(
+                OpenError::IoError {
+                    path: example_segment_path.as_ref().into(),
+                    source: LibError::IoError(
+                        IoError::IoError(
+                            std::io::ErrorKind::NotFound.into()
+                        )
+                    )
+                }
+            )
         }
     }
 
-    pub fn total_size(&self) -> usize {
-        self.volume.max_offset()
+    pub fn open<T: IntoIterator<Item: AsRef<Path>>>(
+        segment_paths: T,
+        ignore_checksums: bool
+    ) -> Result<Self, OpenError>
+    {
+        let mut segment_paths = segment_paths.into_iter().peekable();
+
+        // check that there are some segment files
+        segment_paths.peek().ok_or(OpenError::NoSegmentFiles)?;
+
+        let mut segments: Vec<(PathBuf, Segment)> = vec![];
+        let mut chunk_count = 0;
+
+        let mut volume = None;
+        let mut stored_md5 = None;
+        let mut stored_sha1 = None;
+        let mut done = false;
+
+        // read segments
+        for sp in segment_paths.by_ref() {
+            let _span = debug_span!("", segment_path = ?sp.as_ref()).entered();
+            debug!("opening {}", sp.as_ref().display());
+
+            let io = BytesReader::open(&sp)
+                .map_err(OpenError::from)
+                .map_err(|e| e.with_path(&sp))?;
+
+            debug!("reading sections {}", sp.as_ref().display());
+
+            let header = SegmentFileHeader::new(&io)
+                .map_err(OpenError::from)
+                .map_err(|e| e.with_path(&sp))?;
+
+            let mut chunks = vec![];
+            let mut end_of_sectors = 0;
+
+            let mut seg_volume = None;
+            let mut seg_stored_md5 = None;
+            let mut seg_stored_sha1 = None;
+
+            let mut sections = SectionIterator::new(&io, ignore_checksums);
+
+            for section in sections.by_ref() {
+                match section
+                    .map_err(OpenError::from)
+                    .map_err(|e| e.with_path(&sp))?
+                {
+                    Section::Volume(v) => seg_volume = Some(v),
+                    Section::Table(t) => {
+                        chunks.extend(t);
+                        let chunks_len = chunks.len();
+                        chunks[chunks_len - 1].end_offset = Some(end_of_sectors);
+                    },
+                    Section::Sectors(eos) => end_of_sectors = eos,
+                    Section::Hash(h) => seg_stored_md5 = Some(h.md5().clone()),
+                    Section::Digest(d) => {
+                        seg_stored_md5 = Some(d.md5().clone());
+                        seg_stored_sha1 = Some(d.sha1().clone());
+                    },
+                    Section::Done => { done = true; break; },
+                    _ => {}
+                }
+            }
+
+            if done && sections.next().is_some() {
+                warn!("more sections after done");
+            }
+
+            let sp = sp.as_ref();
+
+            // take the volume section if it's the first one
+            match (seg_volume, &volume) {
+                // we have no volume section, and saw one
+                (Some(sv), None) => volume = Some(sv),
+                // we have a volume section, and didn't see a new one
+                (None, Some(_)) => {},
+                // we have no volume section, and saw none;
+                // this can happen only on the first segment
+                (None, None) =>
+                    return Err(OpenError::MissingVolumeSection(sp.into())),
+                // we have a volume section and saw another one!
+                (Some(_), Some(_)) =>
+                    warn!("duplicate volume section")
+            }
+
+            // take the stored MD5 if it's the first one
+            match (seg_stored_md5, &stored_md5) {
+                (Some(h), None) => stored_md5 = Some(h),
+                (Some(new), Some(old)) if new != *old =>
+                    warn!("duplicate stored MD5s disagree"),
+                _ => {}
+            }
+
+            // take the stored SHA1 if it's the first one
+            match (seg_stored_sha1, &stored_sha1) {
+                (Some(h), None) => stored_sha1 = Some(h),
+                (Some(new), Some(old)) if new != *old =>
+                    warn!("duplicate stored SHA1s disagree"),
+                _ => {}
+            }
+
+            let seg = Segment {
+                io,
+                _header: header,
+                chunks,
+                end_of_sectors
+            };
+
+            chunk_count += seg.chunk_count();
+            segments.push((sp.into(), seg));
+
+            if done {
+                break;
+            }
+        }
+
+        if done {
+            if segment_paths.next().is_some() {
+                warn!("more segments after finding done section");
+            }
+        }
+        else {
+            warn!("read all segments without finding done section");
+        }
+
+        let volume = volume.expect("volume section must have been found");
+
+        let exp_chunk_count = volume.chunk_count as usize;
+
+        if chunk_count > exp_chunk_count {
+            return Err(OpenError::TooManyChunks(chunk_count, exp_chunk_count));
+        }
+        else if chunk_count < exp_chunk_count {
+            return Err(OpenError::TooFewChunks(chunk_count, exp_chunk_count));
+        }
+
+        Ok(E01Reader {
+            volume,
+            segments,
+            stored_md5,
+            stored_sha1,
+            ignore_checksums
+        })
     }
 
     fn get_segment(
         &self,
         chunk_number: usize,
         chunk_index: &mut usize,
-    ) -> Result<&Segment, SimpleError> {
+    ) -> Result<&(PathBuf, Segment), ReadError> {
         let mut chunks = 0;
+// FIXME: Don't use an O(n) algorithm for locating chunks!
         self.segments
             .iter()
-            .find(|s| {
-                if chunk_number >= chunks && chunk_number < chunks + s.chunks.len() {
+            .find(|(_, s)| {
+                if chunk_number >= chunks && chunk_number < chunks + s.chunk_count() {
                     *chunk_index = chunk_number - chunks;
                     return true;
                 }
-                chunks += s.chunks.len();
+                chunks += s.chunk_count();
                 false
             })
-            .ok_or_else(|| {
-                SimpleError::new(format!("Requested chunk number {} is wrong", chunk_number))
-            })
+            .ok_or(ReadError::BadChunkNumber(chunk_number))
     }
 
     pub fn read_at_offset(
         &self,
         mut offset: usize,
         buf: &mut [u8]
-    ) -> Result<usize, SimpleError>
+    ) -> Result<usize, ReadError>
     {
         let total_size = self.total_size();
         if offset > total_size {
-            return Err(SimpleError::new(format!(
-                "Requested offset {} is over max offset {}",
-                offset, total_size
-            )));
+            return Err(ReadError::OffsetBeyondEnd(offset, total_size));
         }
 
         let mut bytes_read = 0;
-        while bytes_read < buf.len() && offset < total_size {
+        let mut remaining_buf = &mut buf[..];
+
+        while !remaining_buf.is_empty() && offset < total_size {
             let chunk_number = offset / self.chunk_size();
             debug_assert!(chunk_number < self.volume.chunk_count as usize);
-            let mut chunk_index = 0;
 
-            let mut data = self
-                .get_segment(chunk_number, &mut chunk_index)?
-                .read_chunk(chunk_number, chunk_index, self.ignore_checksums)?;
+            let mut chunk_index = 0;
+            let (sp, seg) = self.get_segment(chunk_number, &mut chunk_index)?;
+
+            let mut data = seg.read_chunk(
+                chunk_number,
+                chunk_index,
+                self.ignore_checksums,
+                remaining_buf
+            ).map_err(ReadError::from).map_err(|e| e.with_path(sp))?;
 
             if chunk_number * self.chunk_size() + data.len() > total_size {
                 data.truncate(total_size - chunk_number * self.chunk_size());
@@ -638,7 +374,7 @@ impl E01Reader {
             }
 
             let remaining_size = std::cmp::min(buf.len() - bytes_read, data.len() - data_offset);
-            let remaining_buf = &mut buf[bytes_read..bytes_read + remaining_size];
+            remaining_buf = &mut buf[bytes_read..bytes_read + remaining_size];
             remaining_buf.copy_from_slice(&data[data_offset..data_offset + remaining_size]);
 
             debug_assert!(offset + remaining_size <= total_size);
@@ -654,11 +390,22 @@ impl E01Reader {
         self.volume.chunk_size()
     }
 
-    pub fn get_stored_md5(&self) -> Option<&Vec<u8>> {
-        self.stored_md5.as_ref()
+    pub fn total_size(&self) -> usize {
+        self.volume.max_offset()
     }
 
-    pub fn get_stored_sha1(&self) -> Option<&Vec<u8>> {
-        self.stored_sha1.as_ref()
+    pub fn get_stored_md5(&self) -> Option<&[u8]> {
+        self.stored_md5.as_deref()
     }
+
+    pub fn get_stored_sha1(&self) -> Option<&[u8]> {
+        self.stored_sha1.as_deref()
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+
 }
