@@ -1,5 +1,9 @@
 # e01-rs
 
+This project has been relocated to the `imagereader-rs` workspace: https://github.com/strozfriedberg/imagereader-rs.
+This version is archived; please see the workspace project for updates.
+
+------
 `e01-rs` is a Rust library to read data from Expert Witness Format (E01) files.
 This project is in active development and should be considered beta quality, with no known issues.
 
